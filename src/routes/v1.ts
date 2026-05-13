@@ -93,8 +93,22 @@ v1Router.post("/chat/completions", async (c) => {
       const tid = m.tool_call_id ? `(tid=${m.tool_call_id.slice(0, 8)})` : "";
       return `${m.role}${tc}${tid}`;
     });
+    // tools 数量 + tool_choice 是排查"只回一句"的关键证据:
+    // 若 in_tools=0 说明客户端压根没带工具,模型只能文字回答;这是客户端侧问题,网关无法修复。
+    const inTools = Array.isArray(payload.tools) ? payload.tools.length : 0;
+    const outTools = upstreamReq.tools?.length ?? 0;
+    const toolChoice =
+      typeof payload.tool_choice === "string"
+        ? payload.tool_choice
+        : payload.tool_choice
+          ? JSON.stringify(payload.tool_choice).slice(0, 80)
+          : "-";
     console.log(`[req.in]  ${incoming.join(" | ")}`);
     console.log(`[req.out] ${summary.join(" | ")}`);
+    console.log(
+      `[req.meta] in_tools=${inTools} out_tools=${outTools} tool_choice=${toolChoice} ` +
+        `stream=${!!payload.stream} max_tokens=${upstreamReq.max_tokens}`,
+    );
   }
 
   let upstreamRes: Response;
