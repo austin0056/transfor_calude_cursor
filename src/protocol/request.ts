@@ -339,13 +339,54 @@ export function openaiToAnthropic(
     if (seqs.length > 0) anthropicReq.stop_sequences = seqs;
   }
   if (req.tools && req.tools.length > 0) {
-    anthropicReq.tools = req.tools
-      .filter((t) => t.type === "function")
-      .map((t) => ({
-        name: t.function.name,
-        description: t.function.description,
-        input_schema: normalizeInputSchema(t.function.parameters),
-      }));
+    // 之前硬过滤 t.type === "function" 会把 Cursor 发来的工具全部吃掉——
+    // 新版 OpenAI/Cursor 协议里 tool 对象可能:
+    //   - 没有顶层 type 字段(直接 {function:{...}})
+    //   - type 是 "custom" / 空串 / 其它值
+    //   - 甚至工具直接展开到顶层 {name, description, parameters}
+    // 我们这里只要能拿到工具名就接受,尽量不把 Anthropic 不支持的类型硬塞进去。
+    const normalized: AnthropicTool[] = [];
+    const dropped: string[] = [];
+    for (const t of req.tools) {
+      const tt = t as unknown as {
+        type?: string;
+        name?: string;
+        description?: string;
+        parameters?: unknown;
+        input_schema?: unknown;
+        function?: { name?: string; description?: string; parameters?: unknown };
+      };
+      // 明确声明是非 function 类型(如 code_interpreter / file_search / retrieval)的直接丢弃,
+      // Anthropic 没有对应概念,硬转只会被上游 400。
+      if (
+        tt.type &&
+        tt.type !== "function" &&
+        tt.type !== "custom" &&
+        tt.type !== ""
+      ) {
+        dropped.push(`${tt.type}:${tt.function?.name ?? tt.name ?? "?"}`);
+        continue;
+      }
+      const fn = tt.function ?? {};
+      const name = fn.name ?? tt.name;
+      if (!name) {
+        dropped.push(`noname:${tt.type ?? "-"}`);
+        continue;
+      }
+      const params = fn.parameters ?? tt.parameters ?? tt.input_schema;
+      normalized.push({
+        name,
+        description: fn.description ?? tt.description,
+        input_schema: normalizeInputSchema(params),
+      });
+    }
+    if (normalized.length > 0) anthropicReq.tools = normalized;
+    if (dropped.length > 0) {
+      console.warn(
+        `[req.tools] dropped ${dropped.length} tool(s): ${dropped.slice(0, 5).join(", ")}` +
+          (dropped.length > 5 ? ` ...(+${dropped.length - 5})` : ""),
+      );
+    }
   }
   if (req.tool_choice !== undefined) {
     anthropicReq.tool_choice = mapToolChoice(req.tool_choice);
