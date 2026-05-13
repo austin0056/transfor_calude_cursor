@@ -257,6 +257,15 @@ export class AnthropicStreamToOpenAI {
       frames.push(this.chunk({ content: "" }));
     }
     frames.push(this.chunk({}, finish));
+    // OpenAI stream_options.include_usage 风格的 usage 帧:choices=[],带 usage 数字。
+    // 没有这一帧,下游分发层(按 OpenAI 协议读 token 的中转/代理)会显示「本次请求 0 token」。
+    // 我们无条件发——客户端没要 include_usage 也只是多收一帧空 choices,无副作用,
+    // 而 Cursor 这类没显式开关的客户端反而需要它来计费。
+    const inputTotal =
+      this.usage.input_tokens +
+      this.usage.cache_creation_input_tokens +
+      this.usage.cache_read_input_tokens;
+    frames.push(this.usageChunk(inputTotal, this.usage.output_tokens));
     frames.push("data: [DONE]\n\n");
 
     if (config.upstream.debug) {
@@ -281,6 +290,22 @@ export class AnthropicStreamToOpenAI {
     return frames;
   }
 
+  private usageChunk(promptTokens: number, completionTokens: number): string {
+    const payload = {
+      id: this.id,
+      object: "chat.completion.chunk",
+      created: this.created,
+      model: this.model,
+      choices: [],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+    };
+    return `data: ${JSON.stringify(payload)}\n\n`;
+  }
+
   private onError(parsed: Record<string, unknown>): string[] {
     // 上游 error 事件之前被静默丢弃,导致客户端看到「讲一半突然停」。
     // 这里把错误消息透传成一段文本 + 显式 finish_reason=stop + [DONE],
@@ -297,6 +322,12 @@ export class AnthropicStreamToOpenAI {
     frames.push(this.chunk({ content: `\n\n[upstream error: ${msg}]` }));
     this.anyContentSent = true;
     frames.push(this.chunk({}, "stop"));
+    // 错误提前结束时也发 usage 帧,分发层/客户端至少能记到已产生的 input 成本。
+    const inputTotal =
+      this.usage.input_tokens +
+      this.usage.cache_creation_input_tokens +
+      this.usage.cache_read_input_tokens;
+    frames.push(this.usageChunk(inputTotal, this.usage.output_tokens));
     frames.push("data: [DONE]\n\n");
     this.onUsage?.(this.usage);
     console.error(`[upstream.sse] error event: ${err?.type ?? "unknown"} ${msg}`);

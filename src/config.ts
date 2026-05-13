@@ -20,17 +20,17 @@ export const config = {
     enableContext1M: !/^(0|false|off|no)$/i.test(
       process.env.UPSTREAM_CONTEXT_1M ?? "1",
     ),
-    // 客户端未显式指定时的默认 max_tokens。
-    // 之前给 32000 是为了避免长工具链被截断,但很多分发层会按 max_tokens 预扣额度,
-    // 实际只输出几百 token 也按 32k 扣,销售层账单会虚高。
-    // 8192 对 Cursor plan 单轮完全够用(一轮通常几百到两三千 token),有超长输出诉求时
-    // 再通过 UPSTREAM_MAX_TOKENS 调大。客户端显式传的 max_tokens 永远优先于这里。
-    defaultMaxTokens: Number(process.env.UPSTREAM_MAX_TOKENS ?? 8192),
+    // 客户端未显式指定时的默认 max_tokens = 模型输出上限。
+    // Opus 4.x 的 API 硬顶就是 32k,和 1M 上下文 beta(输入窗口)无关——
+    // 一次"能读多少"是 1M,一次"能写多少"是 32k。写大于 32000 上游会拒。
+    // 可通过 UPSTREAM_MAX_TOKENS 覆盖;客户端显式传的 max_tokens 优先。
+    defaultMaxTokens: Number(process.env.UPSTREAM_MAX_TOKENS ?? 32_000),
     // 上游请求超时,默认 5 分钟。1M 上下文首包可能很慢,留够余量。
     timeoutMs: Number(process.env.UPSTREAM_TIMEOUT_MS ?? 300_000),
-    // 流式保活心跳间隔,毫秒。<=0 关闭。默认 15s,给前置代理(Cloudflare/nginx 60s 空闲)
-    // 留够余量,避免 Plan 模式首包慢时连接被掐导致 Cursor 弹「重连」。
-    keepaliveMs: Number(process.env.UPSTREAM_KEEPALIVE_MS ?? 15_000),
+    // 流式保活心跳间隔,毫秒。<=0 关闭。默认 10s,比 Cloudflare/nginx 多数代理的
+    // 60s 空闲阈值小一个数量级,即使某一层 buffer flush 不及时也能撑住连接,
+    // 避免 Plan 模式首包慢时 Cursor 弹「重连」。
+    keepaliveMs: Number(process.env.UPSTREAM_KEEPALIVE_MS ?? 10_000),
     // 打开后会把上游 SSE 事件类型和关键字段打到日志,用于排查「只回一句」「断流」类问题。
     debug: /^(1|true|on|yes)$/i.test(process.env.DEBUG_UPSTREAM ?? "0"),
   },
