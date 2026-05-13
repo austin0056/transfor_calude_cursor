@@ -80,6 +80,37 @@ export interface AnthropicRequest {
   metadata?: { user_id?: string };
 }
 
+// 把 OpenAI tool 消息的 content 稳健地转成一段非空字符串。
+// 客户端(包括 Cursor)可能把工具返回塞成:字符串、null、OpenAI content parts、甚至直接的 JSON 对象。
+// Anthropic tool_result 要求字符串或 block 数组;给空串会让模型误以为工具啥都没返回,导致反复重试。
+function stringifyToolContent(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const p of content) {
+      if (typeof p === "string") {
+        parts.push(p);
+      } else if (p && typeof p === "object") {
+        const obj = p as { type?: string; text?: string };
+        if (obj.type === "text" && typeof obj.text === "string") parts.push(obj.text);
+        else parts.push(safeJson(p));
+      }
+    }
+    return parts.join("\n");
+  }
+  if (typeof content === "object") return safeJson(content);
+  return String(content);
+}
+
+function safeJson(v: unknown): string {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
 function normalizeContent(
   content: OpenAIMessage["content"],
 ): { text: string; blocks: AnthropicContentBlock[] } {
@@ -129,7 +160,9 @@ export function openaiToAnthropic(
     }
 
     if (msg.role === "tool") {
-      const { text } = normalizeContent(msg.content);
+      // 用专用的兜底序列化:即使上游把工具结果塞成 JSON 对象或数组,也能稳定输出非空字符串。
+      // 给空串会让模型以为工具没返回任何内容,进而在 agent 循环里反复调用同一个工具。
+      const text = stringifyToolContent(msg.content) || "[empty tool result]";
       messages.push({
         role: "user",
         content: [
