@@ -2,7 +2,7 @@
 // 只覆盖 Cursor 实际会用到的字段,不追求协议大而全。
 
 export interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
+  role: "system" | "developer" | "user" | "assistant" | "tool";
   content: string | OpenAIContentPart[] | null;
   name?: string;
   tool_calls?: OpenAIToolCall[];
@@ -120,7 +120,9 @@ export function openaiToAnthropic(
 
   // Buffer assistant tool_calls 直到遇到 tool 响应,方便按顺序拼接
   for (const msg of req.messages) {
-    if (msg.role === "system") {
+    // OpenAI 新版协议把 system 拆成 system / developer 两种,后者是给开发者注入指令用,
+    // Anthropic 没有对应概念,统一并入 system。
+    if (msg.role === "system" || msg.role === "developer") {
       const { text } = normalizeContent(msg.content);
       if (text) systemParts.push(text);
       continue;
@@ -161,30 +163,54 @@ export function openaiToAnthropic(
           });
         }
       }
-      messages.push({
-        role: "assistant",
-        content: blocks.length > 0 ? blocks : [{ type: "text", text: "" }],
-      });
+      // assistant 既无文本也无 tool_calls 时跳过,避免合并阶段产生空块。
+      if (blocks.length === 0) continue;
+      messages.push({ role: "assistant", content: blocks });
       continue;
     }
 
     // user
     const { blocks } = normalizeContent(msg.content);
-    messages.push({
-      role: "user",
-      content: blocks.length > 0 ? blocks : [{ type: "text", text: "" }],
-    });
+    if (blocks.length === 0) continue;
+    messages.push({ role: "user", content: blocks });
   }
 
-  // Anthropic 要求 messages 首条是 user;如果全是 system,则补一条空 user
-  if (messages.length === 0 || messages[0].role !== "user") {
-    messages.unshift({ role: "user", content: [{ type: "text", text: "" }] });
+  // 关键修复:Anthropic 要求 user/assistant 严格交替。
+  // OpenAI 协议里多个 tool 响应 + 后续 user 提问会产生多条连续 user 消息,
+  // 直接发上游会被 400 或被部分中转网关静默处理成上下文混乱(常见表现:模型只回一句)。
+  // 这里把连续同角色的消息合并成一条,content blocks 顺序拼接。
+  const merged: AnthropicMessage[] = [];
+  for (const m of messages) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === m.role) {
+      const lastBlocks = Array.isArray(last.content)
+        ? last.content
+        : [{ type: "text" as const, text: last.content }];
+      const curBlocks = Array.isArray(m.content)
+        ? m.content
+        : [{ type: "text" as const, text: m.content }];
+      last.content = [...lastBlocks, ...curBlocks];
+    } else {
+      merged.push({
+        role: m.role,
+        content: Array.isArray(m.content) ? [...m.content] : m.content,
+      });
+    }
   }
+
+  // Anthropic 要求 messages 首条是 user;如果全是 system 或为空,则补一条空 user
+  if (merged.length === 0 || merged[0].role !== "user") {
+    merged.unshift({ role: "user", content: [{ type: "text", text: "" }] });
+  }
+  // 末尾若是 assistant,Anthropic 视为 prefill 模式,Cursor 不会发这种序列;
+  // 但若出现也不报错,这里保持原样。
 
   const anthropicReq: AnthropicRequest = {
     model: upstreamModel,
-    max_tokens: req.max_tokens ?? 8192,
-    messages,
+    // 客户端未指定时给一个大值,避免 Cursor agent 的长工具链或 plan 模式被 max_tokens 截断。
+    // Opus 4.x 输出上限通常为 32k,给 32000 作为兜底;客户端显式传更小值会覆盖。
+    max_tokens: req.max_tokens ?? 32_000,
+    messages: merged,
     stream: req.stream ?? false,
   };
 
@@ -220,6 +246,9 @@ function mapToolChoice(choice: unknown): unknown {
   if (choice === "required") return { type: "any" };
   if (typeof choice === "object" && choice !== null) {
     const c = choice as { type?: string; function?: { name?: string } };
+    if (c.type === "required" || c.type === "any") return { type: "any" };
+    if (c.type === "auto") return { type: "auto" };
+    if (c.type === "none") return { type: "none" };
     if (c.type === "function" && c.function?.name) {
       return { type: "tool", name: c.function.name };
     }
