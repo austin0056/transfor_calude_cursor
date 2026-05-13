@@ -192,12 +192,28 @@ function normalizeContent(
   }
   const blocks: AnthropicContentBlock[] = [];
   const textParts: string[] = [];
+  const dropped: string[] = [];
   for (const part of content) {
-    if (part.type === "text" && part.text) {
-      blocks.push({ type: "text", text: part.text });
-      textParts.push(part.text);
-    } else if (part.type === "image_url" && part.image_url?.url) {
-      const url = part.image_url.url;
+    // Cursor 会把工具调用/结果作为内联 content 块塞在 user/assistant 的 content 数组里
+    // (Anthropic 风格,不是 OpenAI 经典的 role:"tool"/tool_calls)。之前这里只认
+    // text/image_url 导致整段工具历史被静默丢弃,模型看不到结果一直重复调工具。
+    // 现在直接把 tool_use / tool_result 透传成 Anthropic 块。
+    const p = part as unknown as {
+      type?: string;
+      text?: string;
+      image_url?: { url?: string };
+      id?: string;
+      name?: string;
+      input?: unknown;
+      tool_use_id?: string;
+      content?: unknown;
+      is_error?: boolean;
+    };
+    if (p.type === "text" && typeof p.text === "string" && p.text) {
+      blocks.push({ type: "text", text: p.text });
+      textParts.push(p.text);
+    } else if (p.type === "image_url" && p.image_url?.url) {
+      const url = p.image_url.url;
       if (url.startsWith("data:")) {
         const match = /^data:([^;]+);base64,(.*)$/.exec(url);
         if (match) {
@@ -209,7 +225,30 @@ function normalizeContent(
       } else {
         blocks.push({ type: "image", source: { type: "url", url } });
       }
+    } else if (p.type === "tool_use" && p.id && p.name) {
+      blocks.push({
+        type: "tool_use",
+        id: p.id,
+        name: p.name,
+        input: coerceToolInput(p.input),
+      });
+    } else if (p.type === "tool_result" && p.tool_use_id) {
+      const block: AnthropicContentBlock = {
+        type: "tool_result",
+        tool_use_id: p.tool_use_id,
+        content: buildToolResultContent(p.content),
+      };
+      if (p.is_error === true || looksLikeToolError(p.content)) block.is_error = true;
+      blocks.push(block);
+    } else if (p.type) {
+      dropped.push(p.type);
     }
+  }
+  if (dropped.length > 0) {
+    console.warn(
+      `[req.content] dropped ${dropped.length} unknown part(s): ${dropped.slice(0, 5).join(",")}` +
+        (dropped.length > 5 ? ` +${dropped.length - 5}` : ""),
+    );
   }
   return { text: textParts.join("\n"), blocks };
 }
@@ -223,10 +262,20 @@ export function openaiToAnthropic(
 
   // 预扫描一次:收集所有 assistant 发出过的 tool_call id,
   // 用于过滤孤儿 tool_result(Anthropic 会对找不到配对的 tool_use_id 直接 400)。
+  // 同时扫内联 tool_use 块——Cursor 用 Anthropic 风格内联块时,tool_calls 是空的,
+  // id 都在 content 数组里。
   const validToolCallIds = new Set<string>();
   for (const m of req.messages) {
-    if (m.role === "assistant" && m.tool_calls) {
-      for (const c of m.tool_calls) if (c.id) validToolCallIds.add(c.id);
+    if (m.role === "assistant") {
+      if (m.tool_calls) {
+        for (const c of m.tool_calls) if (c.id) validToolCallIds.add(c.id);
+      }
+      if (Array.isArray(m.content)) {
+        for (const p of m.content) {
+          const pp = p as unknown as { type?: string; id?: string };
+          if (pp.type === "tool_use" && pp.id) validToolCallIds.add(pp.id);
+        }
+      }
     }
   }
 
@@ -259,8 +308,14 @@ export function openaiToAnthropic(
 
     if (msg.role === "assistant") {
       const blocks: AnthropicContentBlock[] = [];
-      const { blocks: textBlocks } = normalizeContent(msg.content);
-      blocks.push(...textBlocks);
+      // normalizeContent 现在已经认 text/image/tool_use/tool_result,
+      // assistant 这里直接全收(tool_result 在 assistant 里不合法,但 normalizeContent
+      // 不会从 assistant 的 content 里产出 tool_result,因为 Cursor 也不会这样发)。
+      const { blocks: contentBlocks } = normalizeContent(msg.content);
+      for (const b of contentBlocks) {
+        if (b.type === "tool_result") continue; // 防御性丢弃,assistant 不该有 tool_result
+        blocks.push(b);
+      }
       if (msg.tool_calls) {
         for (const call of msg.tool_calls) {
           let parsed: unknown = {};
@@ -287,8 +342,16 @@ export function openaiToAnthropic(
 
     // user
     const { blocks } = normalizeContent(msg.content);
-    if (blocks.length === 0) continue;
-    messages.push({ role: "user", content: blocks });
+    // user 里的 tool_result 块要做孤儿过滤——找不到配对 tool_use 的会被上游 400。
+    const filtered: AnthropicContentBlock[] = [];
+    for (const b of blocks) {
+      if (b.type === "tool_result") {
+        if (!b.tool_use_id || !validToolCallIds.has(b.tool_use_id)) continue;
+      }
+      filtered.push(b);
+    }
+    if (filtered.length === 0) continue;
+    messages.push({ role: "user", content: filtered });
   }
 
   // 关键修复:Anthropic 要求 user/assistant 严格交替。
