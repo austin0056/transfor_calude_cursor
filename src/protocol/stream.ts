@@ -97,7 +97,10 @@ export class AnthropicStreamToOpenAI {
       case "message_stop":
         return this.onMessageStop();
       case "ping":
-        return [];
+        // 上游 ping 事件之前被静默丢弃,导致首包慢时前置代理(Cloudflare/nginx)
+        // 看不到字节流动,60s 空闲阈值一到就掐连接,Cursor 弹「重连」。
+        // 转发成 SSE comment(以 ":" 开头),OpenAI SSE 解析器会忽略但 TCP 层有字节。
+        return [": ping\n\n"];
       case "error":
         return this.onError(parsed);
       default:

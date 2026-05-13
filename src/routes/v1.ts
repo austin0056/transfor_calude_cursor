@@ -186,18 +186,38 @@ v1Router.post("/chat/completions", async (c) => {
       });
 
       try {
-        for await (const { event, data } of parseSSE(upstreamRes.body)) {
-          const frames = handler.handleFrame(event, data);
-          for (const frame of frames) {
-            // streamSSE 期望 payload/event,这里直接裸写 SSE 帧
-            await sse.write(frame);
+        // 主动心跳:上游 thinking / 长首包期间完全静默,前置代理(Cloudflare/nginx
+        // 空闲 60s)会掐连接,Cursor 弹「重连」。定期写一行 SSE comment 保活,
+        // 任何真实帧写入时重置计时,避免心跳和真实数据打架。
+        let lastWrite = Date.now();
+        const keepaliveMs = config.upstream.keepaliveMs;
+        const keepaliveTimer =
+          keepaliveMs > 0
+            ? setInterval(() => {
+                if (Date.now() - lastWrite >= keepaliveMs) {
+                  sse.write(": keepalive\n\n").catch(() => {});
+                  lastWrite = Date.now();
+                }
+              }, Math.max(1000, Math.floor(keepaliveMs / 2)))
+            : null;
+        try {
+          for await (const { event, data } of parseSSE(upstreamRes.body)) {
+            const frames = handler.handleFrame(event, data);
+            for (const frame of frames) {
+              // streamSSE 期望 payload/event,这里直接裸写 SSE 帧
+              await sse.write(frame);
+              lastWrite = Date.now();
+            }
           }
-        }
-        // 兜底:上游流正常结束但没发 message_stop(中转断连、上游提前 close 等)。
-        // 不补发 finish + [DONE] 会让客户端永远卡在"等最后一帧"。
-        const tail = handler.finalize();
-        for (const frame of tail) {
-          await sse.write(frame);
+          // 兜底:上游流正常结束但没发 message_stop(中转断连、上游提前 close 等)。
+          // 不补发 finish + [DONE] 会让客户端永远卡在"等最后一帧"。
+          const tail = handler.finalize();
+          for (const frame of tail) {
+            await sse.write(frame);
+            lastWrite = Date.now();
+          }
+        } finally {
+          if (keepaliveTimer) clearInterval(keepaliveTimer);
         }
       } catch (err) {
         console.error("[stream] aborted:", (err as Error).message);

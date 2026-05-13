@@ -1,3 +1,5 @@
+import { config } from "../config.js";
+
 // OpenAI Chat Completions 请求/响应 与 Anthropic Messages 之间的相互转换。
 // 只覆盖 Cursor 实际会用到的字段,不追求协议大而全。
 
@@ -384,9 +386,10 @@ export function openaiToAnthropic(
 
   const anthropicReq: AnthropicRequest = {
     model: upstreamModel,
-    // 客户端未指定时给一个大值,避免 Cursor agent 的长工具链或 plan 模式被 max_tokens 截断。
-    // Opus 4.x 输出上限通常为 32k,给 32000 作为兜底;客户端显式传更小值会覆盖。
-    max_tokens: req.max_tokens ?? 32_000,
+    // 客户端显式传的 max_tokens 优先使用;未传时用 config.defaultMaxTokens(默认 8192)。
+    // 之前硬给 32000 会被分发层按上限预扣,销售层账单虚高。注意这是输出上限,
+    // 和 1M 上下文 beta(输入窗口)是两回事。
+    max_tokens: req.max_tokens ?? config.upstream.defaultMaxTokens,
     messages: merged,
     stream: req.stream ?? false,
   };
