@@ -20,6 +20,10 @@ export const config = {
     enableContext1M: !/^(0|false|off|no)$/i.test(
       process.env.UPSTREAM_CONTEXT_1M ?? "1",
     ),
+    // 上游请求超时,默认 5 分钟。1M 上下文首包可能很慢,留够余量。
+    timeoutMs: Number(process.env.UPSTREAM_TIMEOUT_MS ?? 300_000),
+    // 打开后会把上游 SSE 事件类型和关键字段打到日志,用于排查「只回一句」「断流」类问题。
+    debug: /^(1|true|on|yes)$/i.test(process.env.DEBUG_UPSTREAM ?? "0"),
   },
   exposedModel: process.env.EXPOSED_MODEL ?? "claude-opus-4-7",
   admin: {

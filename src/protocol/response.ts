@@ -86,7 +86,8 @@ export function anthropicToOpenAI(
 
   const message: OpenAIChatResponse["choices"][0]["message"] = {
     role: "assistant",
-    content: text.length > 0 ? text : null,
+    // Cursor 等客户端对 content === null 处理不稳,统一给空串兜底。
+    content: text,
   };
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
 

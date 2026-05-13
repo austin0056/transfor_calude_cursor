@@ -2,6 +2,7 @@
 // 以累积状态机形式处理 message_start、content_block_start/delta/stop、message_delta、message_stop。
 // 输出符合 OpenAI chat.completion.chunk 格式。
 
+import { config } from "../config.js";
 import type { UsageStat } from "./response.js";
 
 interface ToolCallState {
@@ -10,6 +11,8 @@ interface ToolCallState {
   name: string;
   argsBuffer: string;
 }
+
+type BlockKind = "text" | "tool_use" | "thinking" | "other";
 
 export interface StreamHandlerOptions {
   exposedModel: string;
@@ -23,7 +26,9 @@ export class AnthropicStreamToOpenAI {
   private readonly onUsage?: (usage: UsageStat) => void;
 
   private roleSent = false;
+  private anyContentSent = false;
   private toolCalls: Map<number, ToolCallState> = new Map();
+  private blockKinds: Map<number, BlockKind> = new Map();
   private nextToolIndex = 0;
   private finishReason: string | null = null;
 
@@ -47,10 +52,20 @@ export class AnthropicStreamToOpenAI {
     try {
       parsed = JSON.parse(data);
     } catch {
+      if (config.upstream.debug) {
+        console.log(`[upstream.sse] bad json event=${event} data=${data.slice(0, 200)}`);
+      }
       return [];
     }
 
     const type = (parsed.type as string) ?? event;
+    if (config.upstream.debug) {
+      const block = parsed.content_block as { type?: string } | undefined;
+      const delta = parsed.delta as { type?: string; stop_reason?: string } | undefined;
+      console.log(
+        `[upstream.sse] type=${type} block=${block?.type ?? "-"} delta=${delta?.type ?? "-"} stop=${delta?.stop_reason ?? "-"}`,
+      );
+    }
     switch (type) {
       case "message_start":
         return this.onMessageStart(parsed);
@@ -65,8 +80,9 @@ export class AnthropicStreamToOpenAI {
       case "message_stop":
         return this.onMessageStop();
       case "ping":
-      case "error":
         return [];
+      case "error":
+        return this.onError(parsed);
       default:
         return [];
     }
@@ -108,12 +124,23 @@ export class AnthropicStreamToOpenAI {
     const block = parsed.content_block as
       | { type?: string; id?: string; name?: string }
       | undefined;
-    if (block?.type === "tool_use") {
+    const blockIdx = Number(parsed.index ?? 0);
+    const kind: BlockKind =
+      block?.type === "text"
+        ? "text"
+        : block?.type === "tool_use"
+          ? "tool_use"
+          : block?.type === "thinking"
+            ? "thinking"
+            : "other";
+    this.blockKinds.set(blockIdx, kind);
+
+    if (kind === "tool_use") {
       const idx = this.nextToolIndex++;
-      this.toolCalls.set(Number(parsed.index ?? idx), {
+      this.toolCalls.set(blockIdx, {
         index: idx,
-        id: block.id ?? "",
-        name: block.name ?? "",
+        id: block?.id ?? "",
+        name: block?.name ?? "",
         argsBuffer: "",
       });
       return [
@@ -121,9 +148,9 @@ export class AnthropicStreamToOpenAI {
           tool_calls: [
             {
               index: idx,
-              id: block.id ?? "",
+              id: block?.id ?? "",
               type: "function",
-              function: { name: block.name ?? "", arguments: "" },
+              function: { name: block?.name ?? "", arguments: "" },
             },
           ],
         }),
@@ -144,6 +171,7 @@ export class AnthropicStreamToOpenAI {
         this.roleSent = true;
       }
       chunks.push(this.chunk({ content: delta.text }));
+      this.anyContentSent = true;
       return chunks;
     }
     if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
@@ -151,6 +179,7 @@ export class AnthropicStreamToOpenAI {
       const state = this.toolCalls.get(blockIdx);
       if (!state) return [];
       state.argsBuffer += delta.partial_json;
+      this.anyContentSent = true;
       return [
         this.chunk({
           tool_calls: [
@@ -162,6 +191,9 @@ export class AnthropicStreamToOpenAI {
         }),
       ];
     }
+    // thinking_delta / signature_delta / 其他:当前静默丢弃。
+    // Anthropic extended thinking 的内容对 OpenAI 客户端没有对应字段,
+    // 强行塞到 content 会污染输出;保留兜底 (message_stop 时若没任何内容再发空串)。
     return [];
   }
 
@@ -180,7 +212,35 @@ export class AnthropicStreamToOpenAI {
   private onMessageStop(): string[] {
     this.onUsage?.(this.usage);
     const finish = this.finishReason ?? "stop";
-    return [this.chunk({}, finish), "data: [DONE]\n\n"];
+    const frames: string[] = [];
+    // 兜底:整条消息没发过任何文本/工具块,至少补一个空字符串 delta,
+    // 避免 Cursor 等客户端拿到「只有 role、没有 content」的流直接判定为空回复。
+    if (!this.anyContentSent) {
+      frames.push(this.chunk({ content: "" }));
+    }
+    frames.push(this.chunk({}, finish));
+    frames.push("data: [DONE]\n\n");
+    return frames;
+  }
+
+  private onError(parsed: Record<string, unknown>): string[] {
+    // 上游 error 事件之前被静默丢弃,导致客户端看到「讲一半突然停」。
+    // 这里把错误消息透传成一段文本 + 显式 finish_reason=stop + [DONE],
+    // 至少让用户能看到原因。
+    const err = parsed.error as { type?: string; message?: string } | undefined;
+    const msg = err?.message ?? "upstream error";
+    const frames: string[] = [];
+    if (!this.roleSent) {
+      frames.push(this.chunk({ role: "assistant", content: "" }));
+      this.roleSent = true;
+    }
+    frames.push(this.chunk({ content: `\n\n[upstream error: ${msg}]` }));
+    this.anyContentSent = true;
+    frames.push(this.chunk({}, "stop"));
+    frames.push("data: [DONE]\n\n");
+    this.onUsage?.(this.usage);
+    console.error(`[upstream.sse] error event: ${err?.type ?? "unknown"} ${msg}`);
+    return frames;
   }
 }
 

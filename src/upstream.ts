@@ -21,10 +21,33 @@ export async function callUpstream(opts: UpstreamCallOptions): Promise<Response>
   if (opts.body.stream) {
     headers.accept = "text/event-stream";
   }
-  return fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(opts.body),
-    signal: opts.signal,
-  });
+
+  // 自带超时:即使外层没传 signal 也强制有上限,避免上游假死时连接永久挂着。
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(new Error(`upstream timeout after ${config.upstream.timeoutMs}ms`)),
+    config.upstream.timeoutMs,
+  );
+  if (opts.signal) {
+    if (opts.signal.aborted) controller.abort(opts.signal.reason);
+    else opts.signal.addEventListener("abort", () => controller.abort(opts.signal?.reason), { once: true });
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(opts.body),
+      signal: controller.signal,
+    });
+    if (config.upstream.debug) {
+      console.log(
+        `[upstream] ${res.status} ${res.statusText} stream=${!!opts.body.stream} ` +
+          `model=${opts.body.model} msgs=${opts.body.messages.length} max_tokens=${opts.body.max_tokens}`,
+      );
+    }
+    return res;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }

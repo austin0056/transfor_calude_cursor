@@ -133,9 +133,11 @@ v1Router.post("/chat/completions", async (c) => {
         await sse.write("data: [DONE]\n\n");
         return;
       }
+      let usageRecorded = false;
       const handler = new AnthropicStreamToOpenAI({
         exposedModel: config.exposedModel,
         onUsage: (usage) => {
+          usageRecorded = true;
           recordUsage({
             apiKeyId: apiKey.id,
             model: config.exposedModel,
@@ -161,12 +163,23 @@ v1Router.post("/chat/completions", async (c) => {
           }
         }
       } catch (err) {
+        console.error("[stream] aborted:", (err as Error).message);
         await sse.write(
           `data: ${JSON.stringify({
             error: { message: (err as Error).message, type: "stream_error" },
           })}\n\n`,
         );
         await sse.write("data: [DONE]\n\n");
+        if (!usageRecorded) {
+          recordUsage({
+            apiKeyId: apiKey.id,
+            model: config.exposedModel,
+            usage: zeroUsage(),
+            stream: true,
+            statusCode: 599,
+            latencyMs: Date.now() - startedAt,
+          }).catch(() => {});
+        }
       }
     });
   }
