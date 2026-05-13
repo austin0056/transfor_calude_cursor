@@ -80,27 +80,73 @@ export interface AnthropicRequest {
   metadata?: { user_id?: string };
 }
 
-// 把 OpenAI tool 消息的 content 稳健地转成一段非空字符串。
-// 客户端(包括 Cursor)可能把工具返回塞成:字符串、null、OpenAI content parts、甚至直接的 JSON 对象。
-// Anthropic tool_result 要求字符串或 block 数组;给空串会让模型误以为工具啥都没返回,导致反复重试。
-function stringifyToolContent(content: unknown): string {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
+// 把 OpenAI tool 消息的 content 转成 Anthropic tool_result.content 接受的形式。
+// 优先返回 block 数组以保留多模态(图片)结构;退化为字符串时也保证非空。
+// Cursor 偶尔会让工具返回带图片的内容(截图、屏幕等),用 block 数组才不丢信息。
+function buildToolResultContent(
+  content: unknown,
+): string | AnthropicContentBlock[] {
+  if (content == null) return "[empty tool result]";
+  if (typeof content === "string") return content || "[empty tool result]";
   if (Array.isArray(content)) {
-    const parts: string[] = [];
+    const blocks: AnthropicContentBlock[] = [];
+    const textBuf: string[] = [];
     for (const p of content) {
       if (typeof p === "string") {
-        parts.push(p);
-      } else if (p && typeof p === "object") {
-        const obj = p as { type?: string; text?: string };
-        if (obj.type === "text" && typeof obj.text === "string") parts.push(obj.text);
-        else parts.push(safeJson(p));
+        textBuf.push(p);
+        continue;
+      }
+      if (!p || typeof p !== "object") continue;
+      const obj = p as { type?: string; text?: string; image_url?: { url?: string } };
+      if (obj.type === "text" && typeof obj.text === "string") {
+        textBuf.push(obj.text);
+      } else if (obj.type === "image_url" && obj.image_url?.url) {
+        // 先把累积的文本作为一个 text block 提交
+        if (textBuf.length > 0) {
+          blocks.push({ type: "text", text: textBuf.join("\n") });
+          textBuf.length = 0;
+        }
+        const url = obj.image_url.url;
+        if (url.startsWith("data:")) {
+          const m = /^data:([^;]+);base64,(.*)$/.exec(url);
+          if (m) {
+            blocks.push({
+              type: "image",
+              source: { type: "base64", media_type: m[1], data: m[2] },
+            });
+          }
+        } else {
+          blocks.push({ type: "image", source: { type: "url", url } });
+        }
+      } else {
+        textBuf.push(safeJson(p));
       }
     }
-    return parts.join("\n");
+    if (textBuf.length > 0) {
+      blocks.push({ type: "text", text: textBuf.join("\n") });
+    }
+    if (blocks.length === 0) return "[empty tool result]";
+    // 如果只剩一个 text block,直接返字符串更简洁
+    if (blocks.length === 1 && blocks[0].type === "text") {
+      return blocks[0].text || "[empty tool result]";
+    }
+    return blocks;
   }
-  if (typeof content === "object") return safeJson(content);
+  if (typeof content === "object") return safeJson(content) || "[empty tool result]";
   return String(content);
+}
+
+// 启发式判断 tool 响应是否是错误。Cursor 偶尔在 content 里塞 {error: "..."} 或带 exit_code。
+// 命中 marker 才打 is_error,避免把正常结果误标。
+function looksLikeToolError(content: unknown): boolean {
+  if (content == null) return false;
+  if (typeof content === "object" && !Array.isArray(content)) {
+    const o = content as Record<string, unknown>;
+    if (typeof o.error === "string" && o.error.length > 0) return true;
+    if (o.is_error === true) return true;
+    if (typeof o.exit_code === "number" && o.exit_code !== 0) return true;
+  }
+  return false;
 }
 
 function safeJson(v: unknown): string {
@@ -109,6 +155,32 @@ function safeJson(v: unknown): string {
   } catch {
     return String(v);
   }
+}
+
+// 强制把 tool_use.input 转成 object。Anthropic 要求该字段必须是 object,
+// 而 OpenAI 的 arguments 可能解析成 null/array/primitive。
+function coerceToolInput(parsed: unknown): Record<string, unknown> {
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed as Record<string, unknown>;
+  }
+  if (parsed === undefined || parsed === null) return {};
+  return { value: parsed };
+}
+
+// 规范化工具 input_schema,Anthropic 要求 object 类型且至少有 properties 字段。
+function normalizeInputSchema(
+  parameters: unknown,
+): Record<string, unknown> {
+  const base: Record<string, unknown> = { type: "object", properties: {} };
+  if (!parameters || typeof parameters !== "object") return base;
+  const p = parameters as Record<string, unknown>;
+  return {
+    ...base,
+    ...p,
+    type: typeof p.type === "string" ? p.type : "object",
+    properties:
+      p.properties && typeof p.properties === "object" ? p.properties : {},
+  };
 }
 
 function normalizeContent(
@@ -149,7 +221,15 @@ export function openaiToAnthropic(
   const systemParts: string[] = [];
   const messages: AnthropicMessage[] = [];
 
-  // Buffer assistant tool_calls 直到遇到 tool 响应,方便按顺序拼接
+  // 预扫描一次:收集所有 assistant 发出过的 tool_call id,
+  // 用于过滤孤儿 tool_result(Anthropic 会对找不到配对的 tool_use_id 直接 400)。
+  const validToolCallIds = new Set<string>();
+  for (const m of req.messages) {
+    if (m.role === "assistant" && m.tool_calls) {
+      for (const c of m.tool_calls) if (c.id) validToolCallIds.add(c.id);
+    }
+  }
+
   for (const msg of req.messages) {
     // OpenAI 新版协议把 system 拆成 system / developer 两种,后者是给开发者注入指令用,
     // Anthropic 没有对应概念,统一并入 system。
@@ -160,19 +240,20 @@ export function openaiToAnthropic(
     }
 
     if (msg.role === "tool") {
-      // 用专用的兜底序列化:即使上游把工具结果塞成 JSON 对象或数组,也能稳定输出非空字符串。
-      // 给空串会让模型以为工具没返回任何内容,进而在 agent 循环里反复调用同一个工具。
-      const text = stringifyToolContent(msg.content) || "[empty tool result]";
-      messages.push({
-        role: "user",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: msg.tool_call_id ?? "",
-            content: text,
-          },
-        ],
-      });
+      const toolUseId = msg.tool_call_id ?? "";
+      // 孤儿 tool_result 会导致上游 400,直接丢弃。通常发生在客户端只回放了部分历史、
+      // 或上下文被截断把前置 assistant 丢了的时候。
+      if (!toolUseId || !validToolCallIds.has(toolUseId)) {
+        continue;
+      }
+      const resultContent = buildToolResultContent(msg.content);
+      const block: AnthropicContentBlock = {
+        type: "tool_result",
+        tool_use_id: toolUseId,
+        content: resultContent,
+      };
+      if (looksLikeToolError(msg.content)) block.is_error = true;
+      messages.push({ role: "user", content: [block] });
       continue;
     }
 
@@ -182,17 +263,19 @@ export function openaiToAnthropic(
       blocks.push(...textBlocks);
       if (msg.tool_calls) {
         for (const call of msg.tool_calls) {
-          let input: unknown = {};
+          let parsed: unknown = {};
           try {
-            input = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+            parsed = call.function.arguments ? JSON.parse(call.function.arguments) : {};
           } catch {
-            input = { _raw: call.function.arguments };
+            // 非法 JSON 通常是 Cursor 在极少数情况下没拼完整的片段;丢到空对象更安全,
+            // 让模型根据后续 tool_result 自己纠错,避免塞 _raw 污染 input schema。
+            parsed = {};
           }
           blocks.push({
             type: "tool_use",
             id: call.id,
             name: call.function.name,
-            input,
+            input: coerceToolInput(parsed),
           });
         }
       }
@@ -235,8 +318,6 @@ export function openaiToAnthropic(
   if (merged.length === 0 || merged[0].role !== "user") {
     merged.unshift({ role: "user", content: [{ type: "text", text: "" }] });
   }
-  // 末尾若是 assistant,Anthropic 视为 prefill 模式,Cursor 不会发这种序列;
-  // 但若出现也不报错,这里保持原样。
 
   const anthropicReq: AnthropicRequest = {
     model: upstreamModel,
@@ -251,7 +332,11 @@ export function openaiToAnthropic(
   if (req.temperature !== undefined) anthropicReq.temperature = req.temperature;
   if (req.top_p !== undefined) anthropicReq.top_p = req.top_p;
   if (req.stop !== undefined) {
-    anthropicReq.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
+    // Anthropic 不接受空字符串 stop 序列,过滤掉空值避免 400。
+    const seqs = (Array.isArray(req.stop) ? req.stop : [req.stop]).filter(
+      (s): s is string => typeof s === "string" && s.length > 0,
+    );
+    if (seqs.length > 0) anthropicReq.stop_sequences = seqs;
   }
   if (req.tools && req.tools.length > 0) {
     anthropicReq.tools = req.tools
@@ -259,10 +344,7 @@ export function openaiToAnthropic(
       .map((t) => ({
         name: t.function.name,
         description: t.function.description,
-        input_schema: (t.function.parameters as Record<string, unknown>) ?? {
-          type: "object",
-          properties: {},
-        },
+        input_schema: normalizeInputSchema(t.function.parameters),
       }));
   }
   if (req.tool_choice !== undefined) {
