@@ -41,7 +41,7 @@ export interface OpenAIChatResponse {
   };
 }
 
-function mapStopReason(reason: string | null): string {
+export function mapStopReason(reason: string | null | undefined): string {
   switch (reason) {
     case "end_turn":
       return "stop";

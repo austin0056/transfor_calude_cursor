@@ -81,6 +81,22 @@ v1Router.post("/chat/completions", async (c) => {
   const startedAt = Date.now();
   touchApiKey(apiKey.id).catch(() => {});
 
+  if (config.upstream.debug) {
+    const summary = upstreamReq.messages.map((m) => {
+      const blocks = Array.isArray(m.content)
+        ? m.content.map((b) => b.type).join(",")
+        : "string";
+      return `${m.role}[${blocks}]`;
+    });
+    const incoming = payload.messages.map((m) => {
+      const tc = m.tool_calls ? `+tc${m.tool_calls.length}` : "";
+      const tid = m.tool_call_id ? `(tid=${m.tool_call_id.slice(0, 8)})` : "";
+      return `${m.role}${tc}${tid}`;
+    });
+    console.log(`[req.in]  ${incoming.join(" | ")}`);
+    console.log(`[req.out] ${summary.join(" | ")}`);
+  }
+
   let upstreamRes: Response;
   try {
     upstreamRes = await callUpstream({ body: upstreamReq });
@@ -136,6 +152,7 @@ v1Router.post("/chat/completions", async (c) => {
       let usageRecorded = false;
       const handler = new AnthropicStreamToOpenAI({
         exposedModel: config.exposedModel,
+        hasTools: !!(upstreamReq.tools && upstreamReq.tools.length > 0),
         onUsage: (usage) => {
           usageRecorded = true;
           recordUsage({
@@ -162,6 +179,12 @@ v1Router.post("/chat/completions", async (c) => {
             await sse.write(frame);
           }
         }
+        // 兜底:上游流正常结束但没发 message_stop(中转断连、上游提前 close 等)。
+        // 不补发 finish + [DONE] 会让客户端永远卡在"等最后一帧"。
+        const tail = handler.finalize();
+        for (const frame of tail) {
+          await sse.write(frame);
+        }
       } catch (err) {
         console.error("[stream] aborted:", (err as Error).message);
         await sse.write(
@@ -184,7 +207,32 @@ v1Router.post("/chat/completions", async (c) => {
     });
   }
 
-  const json = (await upstreamRes.json()) as AnthropicMessageResponse;
+  const rawBody = await upstreamRes.text();
+  let json: AnthropicMessageResponse;
+  try {
+    json = JSON.parse(rawBody) as AnthropicMessageResponse;
+  } catch {
+    // 上游偶尔在 200 下返回 HTML 错误页(网关超时、WAF 拦截等)。
+    // 不容错会让 Hono 默认 500 且漏 recordUsage,排查时很难看出是上游问题。
+    const latency = Date.now() - startedAt;
+    recordUsage({
+      apiKeyId: apiKey.id,
+      model: config.exposedModel,
+      usage: zeroUsage(),
+      stream: false,
+      statusCode: 502,
+      latencyMs: latency,
+    }).catch(() => {});
+    return c.json(
+      {
+        error: {
+          message: `upstream returned non-JSON body: ${rawBody.slice(0, 500)}`,
+          type: "upstream_error",
+        },
+      },
+      502,
+    );
+  }
   const openaiRes = anthropicToOpenAI(json, config.exposedModel);
   const usage = extractUsage(json);
   recordUsage({
