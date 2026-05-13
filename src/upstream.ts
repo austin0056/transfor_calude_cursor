@@ -15,6 +15,9 @@ export async function callUpstream(opts: UpstreamCallOptions): Promise<Response>
     "x-api-key": config.upstream.apiKey,
     authorization: `Bearer ${config.upstream.apiKey}`,
   };
+  if (config.upstream.enableContext1M) {
+    headers["anthropic-beta"] = "context-1m-2025-08-07";
+  }
   if (opts.body.stream) {
     headers.accept = "text/event-stream";
   }

@@ -15,6 +15,11 @@ export const config = {
     baseUrl: (process.env.UPSTREAM_BASE_URL ?? "https://xcapi.top").replace(/\/+$/, ""),
     apiKey: required("UPSTREAM_API_KEY"),
     model: process.env.UPSTREAM_MODEL ?? "claude-opus-4-7",
+    // 默认开启 1M 上下文 beta,Cursor plan 模式会塞很长的上下文,不开会被上游拒掉导致中断。
+    // 如需关闭,设置 UPSTREAM_CONTEXT_1M=0 或 false。
+    enableContext1M: !/^(0|false|off|no)$/i.test(
+      process.env.UPSTREAM_CONTEXT_1M ?? "1",
+    ),
   },
   exposedModel: process.env.EXPOSED_MODEL ?? "claude-opus-4-7",
   admin: {
