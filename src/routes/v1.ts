@@ -191,10 +191,12 @@ v1Router.post("/chat/completions", async (c) => {
       });
 
       try {
-        // 主动心跳:上游 thinking / 长首包期间完全静默,前置代理(Cloudflare/nginx
-        // 空闲 60s)会掐连接,Cursor 弹「重连」。定期写一行 SSE comment 保活,
-        // 任何真实帧写入时重置计时,避免心跳和真实数据打架。
-        let lastWrite = Date.now();
+        // upstreamHeadAt:上游响应头到达的时间戳。诊断 TTFT 时的一致参考点。
+        // (注意:handler 内部的 startedAt 是 handler 构造时间——和这里几乎相等,
+        // 但 v1.ts 的 startedAt 是收到 *客户端* 请求的时间,差几十到上百毫秒。
+        // 用 upstreamHeadAt 才能准确测"上游开始吐 SSE 到我们写出第一帧"的真延迟。)
+        const upstreamHeadAt = Date.now();
+        let lastWrite = upstreamHeadAt;
         let firstClientWriteLogged = false;
         const keepaliveMs = config.upstream.keepaliveMs;
         const keepaliveTimer =
@@ -213,7 +215,7 @@ v1Router.post("/chat/completions", async (c) => {
               // streamSSE 期望 payload/event,这里直接裸写 SSE 帧
               await sse.write(frame);
               if (!firstClientWriteLogged && frame.startsWith("data: ") && config.upstream.debug) {
-                console.log(`[stream.ttft] first data chunk written to client t+${Date.now() - startedAt}ms`);
+                console.log(`[stream.ttft] first data chunk written to client t+${Date.now() - upstreamHeadAt}ms (since upstream head)`);
                 firstClientWriteLogged = true;
               }
               lastWrite = Date.now();
@@ -230,13 +232,20 @@ v1Router.post("/chat/completions", async (c) => {
           if (keepaliveTimer) clearInterval(keepaliveTimer);
         }
       } catch (err) {
-        console.error("[stream] aborted:", (err as Error).message);
-        await sse.write(
-          `data: ${JSON.stringify({
-            error: { message: (err as Error).message, type: "stream_error" },
-          })}\n\n`,
-        );
-        await sse.write("data: [DONE]\n\n");
+        const msg = (err as Error).message;
+        console.error("[stream] aborted:", msg);
+        // 异常截断(undici terminated / 分发层 STREAM_TRUNCATED 等):用 handler.abort
+        // 合成一个干净收尾——已经累计 tool_use 时 finish_reason=tool_calls,Cursor agent
+        // 据此把工具循环继续跑下去,而不是把整轮判定为失败终止。
+        // 之前直接发 stream_error chunk + [DONE] 会让 Cursor 立刻停。
+        try {
+          const tail = handler.abort(msg);
+          for (const frame of tail) {
+            await sse.write(frame);
+          }
+        } catch {
+          // 客户端连接也已经掉了,无能为力。
+        }
         if (!usageRecorded) {
           recordUsage({
             apiKeyId: apiKey.id,

@@ -123,6 +123,47 @@ export class AnthropicStreamToOpenAI {
     return this.onMessageStop();
   }
 
+  // 异常截断时(undici "terminated" / 分发层 STREAM_TRUNCATED 等)的优雅收尾。
+  // 关键:如果已经发过 tool_use 块,要让 finish_reason=tool_calls 而不是 stop,
+  // 这样 Cursor 才会把工具调用闭环跑下去,而不是把整轮判定成失败终止。
+  // 否则按已有内容用 stop 收尾。errorMessage 仅用于日志,不再当成 content 输出
+  // (避免污染代码生成结果)。
+  abort(errorMessage: string): string[] {
+    if (this.closed) return [];
+    this.closed = true;
+    this.onUsage?.(this.usage);
+    const frames: string[] = [];
+    if (!this.roleSent) {
+      frames.push(this.chunk({ role: "assistant", content: "" }));
+      this.roleSent = true;
+    }
+    // 已发过任何块:沿用模型最后一次 stop_reason 推断;否则按是否累计了 tool_use 选择
+    // tool_calls / stop。Cursor agent 看到 tool_calls 才会继续往下推工具循环。
+    let finish: string;
+    if (this.finishReason) {
+      finish = this.finishReason;
+    } else if (this.counters.toolUses > 0) {
+      finish = "tool_calls";
+    } else {
+      finish = "stop";
+    }
+    if (!this.anyContentSent) {
+      frames.push(this.chunk({ content: "" }));
+    }
+    frames.push(this.chunk({}, finish));
+    const inputTotal =
+      this.usage.input_tokens +
+      this.usage.cache_creation_input_tokens +
+      this.usage.cache_read_input_tokens;
+    frames.push(this.usageChunk(inputTotal, this.usage.output_tokens));
+    frames.push("data: [DONE]\n\n");
+    console.warn(
+      `[stream.abort] ${errorMessage} — synthesized finish=${finish} ` +
+        `text_deltas=${this.counters.textDeltas} tool_uses=${this.counters.toolUses}`,
+    );
+    return frames;
+  }
+
   private chunk(delta: Record<string, unknown>, finishReason: string | null = null): string {
     const payload = {
       id: this.id,
