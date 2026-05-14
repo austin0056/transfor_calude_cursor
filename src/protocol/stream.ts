@@ -42,6 +42,11 @@ export class AnthropicStreamToOpenAI {
     thinkingDeltas: 0,
   };
 
+  // 诊断:首个 text_delta 从上游到达的相对时间戳(ms 自构造起算)。
+  // 配合 v1.ts 里写入客户端的时间戳,可以判断"卡"是上游慢、网关传送慢还是代理缓冲。
+  private firstTextDeltaAt: number | null = null;
+  private readonly startedAt = Date.now();
+
   private usage: UsageStat = {
     input_tokens: 0,
     output_tokens: 0,
@@ -197,6 +202,12 @@ export class AnthropicStreamToOpenAI {
     if (!delta) return [];
     if (delta.type === "text_delta" && typeof delta.text === "string") {
       this.counters.textDeltas++;
+      if (this.firstTextDeltaAt === null) {
+        this.firstTextDeltaAt = Date.now() - this.startedAt;
+        if (config.upstream.debug) {
+          console.log(`[stream.ttft] first text_delta from upstream t+${this.firstTextDeltaAt}ms`);
+        }
+      }
       const chunks: string[] = [];
       if (!this.roleSent) {
         chunks.push(this.chunk({ role: "assistant", content: "" }));

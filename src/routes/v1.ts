@@ -158,6 +158,11 @@ v1Router.post("/chat/completions", async (c) => {
   }
 
   if (payload.stream) {
+    // 关代理响应缓冲:nginx/类似层看到 X-Accel-Buffering: no 就不会对 SSE 攒包。
+    // 不加这个头时,前置代理可能等几 KB 才 flush,导致 Cursor 看到的是"整段一起到",
+    // 而不是逐 token 流式。Cache-Control 一并显式声明,避免任何中间层做条件缓存。
+    c.header("X-Accel-Buffering", "no");
+    c.header("Cache-Control", "no-cache, no-transform");
     return streamSSE(c, async (sse) => {
       if (!upstreamRes.body) {
         await sse.write("data: [DONE]\n\n");
@@ -190,6 +195,7 @@ v1Router.post("/chat/completions", async (c) => {
         // 空闲 60s)会掐连接,Cursor 弹「重连」。定期写一行 SSE comment 保活,
         // 任何真实帧写入时重置计时,避免心跳和真实数据打架。
         let lastWrite = Date.now();
+        let firstClientWriteLogged = false;
         const keepaliveMs = config.upstream.keepaliveMs;
         const keepaliveTimer =
           keepaliveMs > 0
@@ -206,6 +212,10 @@ v1Router.post("/chat/completions", async (c) => {
             for (const frame of frames) {
               // streamSSE 期望 payload/event,这里直接裸写 SSE 帧
               await sse.write(frame);
+              if (!firstClientWriteLogged && frame.startsWith("data: ") && config.upstream.debug) {
+                console.log(`[stream.ttft] first data chunk written to client t+${Date.now() - startedAt}ms`);
+                firstClientWriteLogged = true;
+              }
               lastWrite = Date.now();
             }
           }
